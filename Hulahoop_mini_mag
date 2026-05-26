@@ -1,0 +1,364 @@
+/*
+  Seeed_Arduino_LSM6DS3 - Accelerometer
+  The circuit:
+  - Seeedstudio XIAO nRF52840 Sense
+
+  created 21 March 2026
+  by Mario Koren  
+
+1. Repository hinzufügen: Gehen Sie zu Datei > Voreinstellungen und fügen Sie die folgende URL bei "Zusätzliche Boardverwalter-URLs" ein:
+   https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
+
+2.Board-Paket installieren:
+    Navigieren Sie zu Werkzeuge > Board > Boardverwalter.
+    Suchen Sie nach "Seeed nRF52".
+    Installieren Sie das Paket Seeed nRF52 Boards (für Standard-Anwendungen) oder Seeed nRF52 mbed-enabled Boards (empfohlen für IMU- und Mikrofon-Nutzung).
+
+3.Board auswählen: Wählen Sie unter Werkzeuge > Board > Seeed nRF52 Boards den Eintrag Seeed XIAO nRF52840 Sense aus.
+######################################################################################################################
+
+6-Achsen-IMU (LSM6DS3TR-C): Für die Nutzung der Bewegungsdaten wird die Seeed_Arduino_LSM6DS3 Bibliothek empfohlen.
+######################################################################################################################
+
+3 Achsen Magnetometer HMC5883
+
+Pakeke nachinstallieren
+sudo apt update
+sudo apt install pipx
+pipx ensurepath
+pipx install adafruit-nrfutil
+*/
+
+#include <Wire.h>
+#include <ArduinoBLE.h>
+#include <math.h>
+#include <QMC5883LCompass.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_HMC5883_U.h>
+#include <LSM6DS3.h>
+//#include <Adafruit_TinyUSB.h> //Wenn fehler mit Serial Referenz..
+
+// Instanz für die Sensoren (I2C)
+LSM6DS3 IMU(I2C_MODE, 0x6A);
+Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
+
+// Einzigartige IDs für deinen SmartHoop
+BLEService hoopService("19B10000-E8F2-537E-4F6C-D104768A1214");
+BLEUnsignedIntCharacteristic rundenChar("19B10001-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify);
+BLEUnsignedIntCharacteristic schwungChar("19B10004-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify);  // Neue ID für Hüftschwuenge
+BLEFloatCharacteristic rpmChar("19B10002-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify);
+BLEFloatCharacteristic kraftChar("19B10003-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify);
+
+// XIAO nRF52840 Sense RGB LED Pins
+//Wichtig beim XIAO: Die interne LED ist "Active LOW". Das bedeutet: digitalWrite(pin, LOW) schaltet sie AN, und HIGH schaltet sie AUS.
+const int LED_BLAU = LEDB;
+const int LED_ROT = LEDR;
+const int LED_GRUEN = LEDG;
+
+// --- PARAMETER ---
+const float REIFEN_MASSE_KG = 0.5;
+// Schwellenwert für kombinierte Kraft (G-Kraft Vektor aus Taumeln + Fliehkraft)
+const float COMBINED_THRESHOLD = 1.2;  // Wenn der Zähler zu sensibel ist, erhöhe den COMBINED_THRESHOLD schrittweise (z. B. auf 1.8 oder 2.0).
+const unsigned long DEBOUNCE_ACC = 250;
+const unsigned long DEBOUNCE_MAG = 200;
+const float MIN_RPM_THRESHOLD = 20.0;  // Mindestgeschwindigkeit zum Zählen
+
+// --- MAG KALIBRIERUNG (Ermittelten Werte!) ---
+float xOffset = -2.32;            // Hier den berechneten X-Offset eintragen
+float zOffset = -12.75;           // Hier den berechneten Z-Offset eintragen
+float declinationAngle = 0.0928;  // Simering Magnetic Declination: +5° 19' -  Formel: (5 + (19 / 60.0)) * (PI / 180.0)
+
+// --- VARIABLEN ---
+int runden = 0;     // Zähler für die Gesamtzahl der Runden.
+int schwuenge = 0;  // Beschleunigung (Impuls)
+float rpm = 0.0;
+unsigned long letzteRundenZeit = 0;   // Zeitstempel der letzten Runde für die RPM-Berechnung
+unsigned long letzteSchwungZeit = 0;  // Zeitstempel der letzten Runde für die Hüftschwung-Berechnung
+bool peakSperre = false;              // Sperre für Beschleunigung
+bool wasInTargetZone = false;         // Sperre für Magnetometer
+float gOffset = 1.0;                  // Standardwert, wird in setup() kalibriert
+float ax, ay, az;
+
+// --- AUTO-KALIBRIERUNG VARIABLEN ---
+float maxG_Gesehen = 0.0;
+float dynamischerThreshold = 1.3;  // Startwert
+unsigned long kalibrierungsEnde = 0;
+bool istAmKalibrieren = true;
+const unsigned long KALIBRIERUNGS_DAUER = 5000;  // 5 Sekunden Einpeitschen
+
+void setup() {
+  //----------------------------------Serial START ---------------------------------
+  Serial.begin(115200);                                   //Startet die USB-Ausgabe zum PC
+  unsigned long startVerzoegerung = millis();             // Kurze Pause für den Serial Monitor
+  while (!Serial && millis() - startVerzoegerung < 3000)  // WICHTIG: Timeout für Serial, damit es auch am Akku startet
+    ;
+
+  //------------------------BLE START (Frühzeitig initialisieren)-------------------
+  if (!BLE.begin()) {
+    Serial.println("BLE Fehler!");
+    while (1)
+      ;
+  }
+  Serial.println("BLE Firmware geladen!");
+  delay(100);
+
+  //------------------------- Magnetometer Start------------------------------------
+  //mag.setMagGain(HMC5883_MAGGAIN_1_3); // Standard
+  if (!mag.begin()) {
+    Serial.println("HMC5883 Fehler!");
+    while (1)
+      ;
+  }
+  Serial.println("MAG Firmware geladen!");
+  delay(100);
+
+  // Initialisiert den Sensor und Wire1 intern und stellt die Samplerate auf 26Hz
+  IMU.settings.accelSampleRate = 52;  // In Hz. Mögliche Werte: 13, 26, 52, 104, 208, 416, 833, 1666
+  Serial.println("Starte IMU.begin()...");
+  if (IMU.begin() != 0) {
+    Serial.println("IMU Fehler, LSM6DS3 nicht gefunden!!");
+    while (1)
+      ;
+  }
+  Serial.println("IMU Firmware geladen!");
+  delay(100);
+
+  // LED Pins als Ausgang definieren
+  pinMode(LED_BLAU, OUTPUT);
+  pinMode(LED_ROT, OUTPUT);
+  pinMode(LED_GRUEN, OUTPUT);
+
+  // Alle LEDs aus (HIGH = AUS beim XIAO)
+  digitalWrite(LED_BLAU, HIGH);
+  digitalWrite(LED_ROT, HIGH);
+  digitalWrite(LED_GRUEN, HIGH);
+
+
+  // -------------------- KALIBRIERUNG (Reifen ruhig halten!) ---------------------
+  //Kalibrierung wenn der Reifen senkrecht hängt, ansonsten wir der Offset auf 1.0G gestellt
+  Serial.println("Kalibrierung...");
+  // Blaue LED an zum Start der Kalibrierung
+  digitalWrite(LED_BLAU, LOW); 
+  float summeY = 0;
+  for (int i = 0; i < 50; i++) {
+    summeY += IMU.readFloatAccelY();  // Wir messen, wie stark die Schwerkraft auf Z wirkt
+    delay(10);
+  }
+  gOffset = summeY / 50.0;
+  Serial.print("Offset erkannt: ");
+  Serial.println(gOffset);
+  // Falls der Offset fast 0 ist (Sensor liegt flach), erzwinge 1.0
+  if (abs(gOffset) < 0.5) {
+    gOffset = 1.0;
+    Serial.print("Offset angepasst da kleiner als 0.5: ");
+    Serial.println(gOffset);
+    digitalWrite(LED_BLAU, HIGH);
+    digitalWrite(LED_RED, LOW); 
+    delay(1000);
+    digitalWrite(LED_RED, HIGH);
+    digitalWrite(LED_GRUEN, LOW); 
+  }
+  else{
+     digitalWrite(LED_BLAU, HIGH); 
+     digitalWrite(LED_GRUEN, LOW); 
+  }   // Blaue LED an zum Start der Kalibrierung
+ 
+
+  //-------------------------- BLE Setup Android App zb.:nRF Connect-----------------------
+  BLE.setLocalName("SmartHoop");
+  BLE.setDeviceName("SmartHoop");  // Wichtig für manche Android-Versionen
+  BLE.setAdvertisedService(hoopService);
+  hoopService.addCharacteristic(rundenChar);
+  hoopService.addCharacteristic(schwungChar);
+  hoopService.addCharacteristic(rpmChar);
+  hoopService.addCharacteristic(kraftChar);
+  BLE.addService(hoopService);  // Datenfelder zum Service hinzufügen
+
+  // ------------------------------Startwerte setzen----------------------------------------
+  rundenChar.writeValue(0);
+  schwungChar.writeValue(0);
+  rpmChar.writeValue(0.0);
+  kraftChar.writeValue(0.0);
+
+  //---------------------- Signal aussenden: "Ich bin bereit zum Koppeln"-------------------
+  BLE.advertise();
+  Serial.println("Bluetooth aktiv. Suche nach 'SmartHoop' in nRF Connect.");
+
+
+  Serial.println("Starte Datenausgabe...");
+}
+
+void loop() {
+  // ---------1. Bluetooth-Status pflegen (muss so oft wie möglich aufgerufen werden)-------
+  BLE.poll();
+  unsigned long jetzt = millis();  // Aktuelle Zeit in Millisekunden
+
+  // ----------------------- 1. MAGNETOMETER: RUNDENZÄHLUNG (360°) --------------------------
+  sensors_event_t magEvent;
+  mag.getEvent(&magEvent);
+  float x_corr = magEvent.magnetic.x - xOffset;
+  float z_corr = magEvent.magnetic.z - zOffset;
+  float heading = atan2(x_corr, z_corr);  //Berechnet den Winkel (im Bogenmaß/Radiant) aus den zwei Magnet-Achsen. Stell dir vor, X und Z sind Koordinaten auf einer Landkarte; atan2 sagt dir, in welchem Winkel das Ziel liegt.
+
+  heading += declinationAngle;                  //Korrigiert die Abweichung zwischen dem magnetischen Nordpol und dem geografischen Norden (deine +5° 19').
+  if (heading < 0) heading += 2 * PI;           //Werte von -π bis +π liefert, verschieben wir alles in den Bereich 0 bis 2π (0 bis 360°), damit wir keine negativen Winkel haben.
+  float headingDegrees = heading * 180 / M_PI;  //Rechnet den Radiant-Wert (z.B. 3.14) in handfeste Grad (180°) um
+
+  if (headingDegrees > 0 && headingDegrees < 60) {                        // Das ist der "Start/Ziel-Bogen" (Norden). Wenn der Reifen in diesem Fenster ist, will der Code zählen.
+    if (!wasInTargetZone && (jetzt - letzteRundenZeit > DEBOUNCE_MAG)) {  //Zählt nur, wenn du gerade eben nicht schon hier warst." Das verhindert, dass eine einzige Runde (die z.B. 50ms im Fenster bleibt) 10-mal gezählt wird.
+      unsigned long dauer = jetzt - letzteRundenZeit;
+      if (letzteRundenZeit != 0) {
+        float aktuelleRPM = 60000.0 / dauer;  //Berechnet die Geschwindigkeit. 60.000 ms (1 Minute) geteilt durch die Zeit für eine Runde ergibt die Umdrehungen pro Minute (RPM).
+        if (aktuelleRPM >= MIN_RPM_THRESHOLD) {
+          runden++;
+          rpm = aktuelleRPM;
+          rundenChar.writeValue(runden);
+          rpmChar.writeValue(rpm);
+        }
+      }
+      letzteRundenZeit = jetzt;
+      wasInTargetZone = true;  //Er hat gezählt, jetzt darf er erst wieder zählen, wenn er einmal "ganz rum" ist.
+    }
+  } else if (headingDegrees > 120 && headingDegrees < 240) {  // Die Entriegelung (Süden). Erst wenn der Reifen auf der gegenüberliegenden Seite ist, wird wasInTargetZone wieder auf false gesetzt.
+    wasInTargetZone = false;                                  //Der Riegel geht auf, und er ist bereit für die nächste Zielüberquerung im Norden.
+  }
+
+  // Beschleunigungs-Sensordaten auslesen
+  ay = IMU.readFloatAccelY();
+  az = IMU.readFloatAccelZ();
+  float dY = max(0.0f, ay - gOffset);  // setzt alle negativen G der Y-Achse auf 0 und zieht den gOffset (Schwerkraft) ab, dadurch ist der Wert im Stillstand nahe 0.0 statt 1.0.
+  float dZ = max(0.0f, az);            // setzt alle negativen G der Z-Achse auf
+
+  // HYBRID-LOGIK: Es wird die Stärke der Bewegung aus
+  // der Fliehkraft (Z) und dem Taumeln/Kippen (Y) berechnet.
+  // Wir ignorieren X (Bewegung in Laufrichtung), um Rauschen zu minimieren.
+  float kombiniertG = sqrt(dY * dY + dZ * dZ);
+
+  // // --- AUTO-KALIBRIERUNG (Die ersten 5 Sekunden) ---
+  // if (istAmKalibrieren) {
+  //   if (kalibrierungsEnde == 0) kalibrierungsEnde = jetzt + KALIBRIERUNGS_DAUER;
+
+  //   // Wir suchen den höchsten Peak während du loslegst
+  //   if (kombiniertG > maxG_Gesehen) maxG_Gesehen = kombiniertG;
+
+  //   if (jetzt > kalibrierungsEnde) {
+  //     // Setze Threshold auf 70% des Max-Werts, aber nicht unter 1.1 (Grundrauschen)
+  //     dynamischerThreshold = max(1.1f, maxG_Gesehen * 0.7f);
+  //     istAmKalibrieren = false;
+  //     Serial.print("KALIBRIERUNG FERTIG! Neuer Threshold: ");
+  //     Serial.println(dynamischerThreshold);
+  //   }
+  // }
+
+  // // --- HÜFTSCHWUNG-ZÄHLER (Nutzt den dynamischen Threshold) ---
+  // if (!istAmKalibrieren && kombiniertG > dynamischerThreshold && !peakSperre) {
+  //   if (jetzt - letzteSchwungZeit > DEBOUNCE_ACC) {
+  //     schwuenge++;
+  //     schwungChar.writeValue(schwuenge);
+  //     letzteSchwungZeit = jetzt;
+  //     peakSperre = true;
+  //     Serial.print("SCHWUNG! G: "); Serial.print(kombiniertG);
+  //     Serial.print(" | Threshold: "); Serial.println(dynamischerThreshold);
+  //   }
+  // }
+
+  // // Hysterese zum Freigeben (30% unter Threshold)
+  // if (kombiniertG < (dynamischerThreshold * 0.7)) {
+  //   peakSperre = false;
+  // }
+
+  // Hüftschwung-Zählung
+  if (kombiniertG > COMBINED_THRESHOLD && !peakSperre) {
+    //Wenn letzteRundenZeit 0 ist, ist dies der allererste Schwung.
+    // Wir starten nur den Timer, zählen aber noch keine Runde.
+    if (letzteRundenZeit == 0) {
+      letzteRundenZeit = jetzt;
+      peakSperre = true;
+      Serial.println("Messung gestartet...");
+    } else {
+      unsigned long dauer = jetzt - letzteRundenZeit;
+      if (dauer > DEBOUNCE_ACC) {
+        float aktuelleRPM = 60000.0 / dauer;
+
+        if (aktuelleRPM >= MIN_RPM_THRESHOLD) {
+          schwuenge++;
+          schwungChar.writeValue(schwuenge);
+        }
+        letzteRundenZeit = jetzt;
+        peakSperre = true;
+      }
+    }
+  }
+
+  // Hysterese zum Zurücksetzen der Sperre
+  if (kombiniertG < (COMBINED_THRESHOLD - 0.3)) {
+    peakSperre = false;
+  }
+  //if (kombiniertG < (dynamischerThreshold * 0.7)) {
+  //   peakSperre = false;
+  // }
+
+  // KRAFTBERECHNUNG (Bereinigte Zentripetalkraft)
+  // Nur die dynamische Komponente über dem Offset)
+  // Wir ziehen den Ruhe-Offset ab, um bei Stillstand 0N zu erhalten
+  // max(0.0, ...) verhindert negative Newton-Werte.
+  float dynamischeG = max(0.0, abs(az) - abs(gOffset));
+  float kraft_newton = REIFEN_MASSE_KG * (dynamischeG * 9.81);
+
+  static unsigned long lastUpdate = 0;
+  if (millis() - lastUpdate > 300) {
+    if (millis() - letzteRundenZeit > 3000) {  // Auto-Reset bei Stillstand (> 3 Sek)
+      kraft_newton = 0.0;
+      rpm = 0.0;
+      rpmChar.writeValue(0.0);
+    }
+
+    kraftChar.writeValue(kraft_newton);
+
+    Serial.print("Deg: ");
+    Serial.print(headingDegrees, 0);
+    Serial.print(" | Runden: ");
+    Serial.print(runden);
+    Serial.print(" | Schwuenge: ");
+    Serial.print(schwuenge);
+    Serial.print(" | Kraft: ");
+    Serial.print(kraft_newton, 2);
+    Serial.print(" N");
+    Serial.print(" | Y: ");
+    Serial.print(abs(dY));
+    Serial.print(" | Y ohne G: ");
+    Serial.print(ay);
+    Serial.print(" | Z: ");
+    Serial.print(dZ);
+    Serial.print(" | Gesamt Kominiert: ");
+    Serial.println(kombiniertG);
+
+    lastUpdate = millis();
+  }
+}
+
+
+/*
+Um beide physikalischen Effekte (Taumelbewegung auf der Z-Achse und Hüftstöße/Fliehkraft auf der Y-Achse) gleichzeitig zu nutzen, wird es zu einem Gesamtbeschleunigungsvektor kombiniert.
+Der Vorteil: Egal ob der Reifen eiert, kippt oder nur fest angestoßen wird – die resultierende Kraftspitze wird zuverlässig erfasst.
+
+Vektorsumme (sqrt(ay*ay + az*az)): Diese mathematische Formel (Satz des Pythagoras) fasst die seitliche Kraft und das vertikale Wackeln zu einem einzigen Signalwert zusammen. Das macht das System extrem robust gegen verschiedene Hula-Hoop-Stile.
+Kompensation: Wenn du den Reifen sehr flach hältst, reagiert das System primär auf die Y-Achse (Fliehkraft). Wenn der Reifen anfängt zu eiern, liefert die Z-Achse zusätzliche Daten, die den Peak verstärken.
+Fehlertoleranz: Kleine Erschütterungen auf nur einer Achse lösen seltener Fehlzählungen aus, da die Kombination beider Achsen einen echten "Impuls" benötigt.
+################################################################################################################################################################################
+
+Was bewirkt die Kalibrierung?
+  In den ersten 1-2 Sekunden nach dem Start (während die for-Schleife läuft) misst der Arduino 50-mal die Beschleunigung.
+  Er berechnet den Durchschnittswert der Schwerkraft (gOffset), der auf die Y-Achse drückt.
+  In der loop() wird dieser Wert von den Live-Daten abgezogen. Dadurch springt die Anzeige in nRF Connect im Stillstand sauber auf 0.00 N.
+
+Wichtiger Hinweis: Du musst den Reifen beim Einschalten oder nach einem Reset für ca. 2 Sekunden ruhig halten, damit der Nullpunkt korrekt gesetzt wird.
+################################################################################################################################################################################
+
+Was bewirkt die 40-RPM-Sperre?
+    Keine Geisterrunden: Wenn du den Reifen nur langsam in die Hand nimmst oder ihn langsam um die Hüfte "rollen" lässt, ohne wirklich zu schwingen, wird die Runde ignoriert.
+    Präzision: Eine Umdrehung dauert bei 40 RPM genau 1,5 Sekunden. Alles, was länger dauert, wertet der Tracker als "nicht sportlich relevant".
+    Erste Runde: Damit die Zeitmessung überhaupt starten kann, wird der allererste Impuls (nach dem Einschalten) immer akzeptiert, um letzteRundenZeit zu setzen.
+Probier es aus: Schwing den Reifen an. Er sollte erst ab einer gewissen Grundgeschwindigkeit anfangen zu zählen.
+################################################################################################################################################################################
+*/
